@@ -432,6 +432,24 @@ User request: no more nine terminals; a "communication lost" error during a test
   snapshots (need the Gazebo camera over ROS 2); PX4 battery/altitude fields with PX4 running.
 
 
+## 1p. 2026-11-11 — the project is on GitHub
+
+- **https://github.com/abhi-gupta2005/NIDAR_DRONE_PROJECT** — public, branch `main`, first commit `251032c`
+  (193 files, ~21 MB: code, tests, Gazebo worlds/models, ROS 2 package source, installers, `yoloe-26n-seg.pt`,
+  `models/nidar_aerial_yolo26n_cpu15_640.pt`, the demo flight record). The git repository is
+  `D:\NIDAR_DRONE_PROJECT\.git` (remote `origin`). Not uploaded (`.gitignore`): logs, run outputs, videos, `.tgz`
+  bundles, `.venv`, `mobileclip2_b.ts`, `archive/`, `gazebo_existing/`, `pi_files/`, `Claude outputs/`.
+- Before uploading: no passwords, tokens or private keys found in the uploaded files (only the Pi's private LAN
+  address and user name as launcher defaults).
+- Placeholders filled in `tools/install_windows.ps1`, `README.md`, `docs/SETUP.md`.
+- **Verified:** a fresh clone from GitHub has the 193 files, LF endings in every `.sh`, and `tests/test_nidar_run.py`
+  passes on it (6 passed); the friend's raw file `tools/install_windows.ps1` downloads with the real repo address.
+- **Friend's first command** (PowerShell as administrator):
+  `irm https://raw.githubusercontent.com/abhi-gupta2005/NIDAR_DRONE_PROJECT/main/tools/install_windows.ps1 | iex`
+- **Uploading later changes:** WSL `bash /mnt/d/NIDAR_DRONE_PROJECT/tools/publish_github.sh` (logs in to GitHub once
+  in WSL, then commits and pushes). The login used for this first upload was in a temporary workspace and was removed.
+- Still **not verified:** the install on the friend's laptop and Pi.
+
 ## 1o. 2026-11-11 — installing everything on a new laptop + Pi (GitHub, 4 commands)
 
 - **Owner, once:** `tools/publish_github.sh` (git + GitHub CLI, browser login, creates the repo, writes its address into
