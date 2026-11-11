@@ -1,0 +1,7 @@
+# Windows laptop: camera AI for nidar_v11_windows.py (installed by tools/install_windows.ps1)
+#   py -3 -m pip install -r requirements-windows.txt
+ultralytics>=8.4
+opencv-python>=4.10
+numpy>=1.26
+pyyaml>=6
+pytest>=8

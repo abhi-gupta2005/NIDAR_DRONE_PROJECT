@@ -1,0 +1,33 @@
+# NIDAR AirMouse — what stays OUT of the GitHub repository (2026-11-11)
+# run outputs, logs, local environments
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+logs/
+logs_backup_*/
+outputs/
+recordings/
+gcs_reports/
+gcs_records/*
+!gcs_records/demo_s1_offline/
+src/communication/nidar_latest_perception.json
+src/communication/nidar_latest_scan.json
+src/communication/*.csv
+nidar_v18_headless_persistent_fusion.json
+nidar_v18_headless_persistent_fusion.csv
+multi_object_tracking_v10*
+# bundles, videos, copies and snapshots
+*.tgz
+*.files.txt
+*.mp4
+archive/
+gazebo_existing/
+pi_files/
+pi_status.txt
+Claude outputs/
+docs/*.bak_*
+# too big for GitHub (ultralytics downloads it by itself on the first YOLOE start)
+mobileclip*.ts
+# cloned by tools/install_wsl.sh into ~/px4_ros2_ws (has its own git history)
+ros2_ws_src/px4_msgs/

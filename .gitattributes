@@ -1,0 +1,14 @@
+# Linux scripts must keep LF line endings even when cloned on Windows (git's autocrlf would break bash)
+* text=auto
+*.sh text eol=lf
+*.bash text eol=lf
+*.py text eol=lf
+*.sdf text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.ps1 text eol=crlf
+*.pt binary
+*.gz binary
+*.png binary
+*.jpg binary
+*.npy binary

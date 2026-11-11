@@ -1,0 +1,8 @@
+# Test harness + simulation (all machines)
+numpy>=1.26
+pytest>=8
+pyyaml>=6
+
+# Training / evaluation (Windows laptop or GPU machine only)
+# ultralytics>=8.4
+# pillow>=10

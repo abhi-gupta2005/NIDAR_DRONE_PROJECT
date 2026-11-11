@@ -1,0 +1,8 @@
+# Raspberry Pi (Raspberry Pi OS 64-bit): installed from the OS packages by tools/install_pi_fresh.sh
+#   python3-numpy python3-opencv python3-serial python3-yaml python3-pytest
+# Same with pip (slower on a Pi 3B+), inside ~/drone_project/.venv:
+numpy>=1.26
+opencv-python-headless>=4.8
+pyserial>=3.5
+pyyaml>=6
+pytest>=8

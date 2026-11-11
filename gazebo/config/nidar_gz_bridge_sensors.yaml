@@ -1,0 +1,13 @@
+# ros_gz_bridge config: NIDAR sensors only (use with the PX4 drone x500_nidar_airmouse).
+# PX4 state and setpoints do NOT go through this bridge; they use uXRCE-DDS (/fmu/...).
+#   ros2 run ros_gz_bridge parameter_bridge --ros-args -p config_file:=<this file>
+- ros_topic_name: "/nidar/scan"
+  gz_topic_name: "/nidar/scan"
+  ros_type_name: "sensor_msgs/msg/LaserScan"
+  gz_type_name: "gz.msgs.LaserScan"
+  direction: GZ_TO_ROS
+- ros_topic_name: "/nidar/camera/image"
+  gz_topic_name: "/nidar/camera/image"
+  ros_type_name: "sensor_msgs/msg/Image"
+  gz_type_name: "gz.msgs.Image"
+  direction: GZ_TO_ROS

@@ -1,0 +1,15 @@
+services:
+  nidar:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: nidar
+    environment:
+      - QT_X11_NO_MITSHM=1
+      - QT_QPA_PLATFORM=offscreen
+    volumes:
+      - .:/app
+    network_mode: host
+    stdin_open: true
+    tty: true
+    command: ["python", "nidar_pi_receiver.py"]

@@ -1,0 +1,2804 @@
+#!/usr/bin/env python3
+
+import csv
+import json
+import math
+import os
+import signal
+import sys
+import time
+
+# ============================================================
+# SELF-CONTAINED PROJECT IMPORT PATHS
+# Allows this file to be started directly with:
+#   python src/perception/nidar_v18_headless_persistent_fusion.py
+# without manually setting PYTHONPATH.
+# ============================================================
+_THIS_FILE = os.path.abspath(__file__)
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(_THIS_FILE), "..", ".."))
+_SRC_ROOT = os.path.join(_PROJECT_ROOT, "src")
+for _path in (_PROJECT_ROOT, _SRC_ROOT, os.path.join(_SRC_ROOT, "core"),
+              os.path.join(_SRC_ROOT, "tracking"), os.path.join(_SRC_ROOT, "perception"),
+              os.path.join(_SRC_ROOT, "simulation")):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
+
+from lidar_interface import SimulatedSTL19PBackend
+
+# 2026-11-02: optional LiDAR from the Gazebo simulation, selected with
+# NIDAR_LIDAR_BACKEND=GAZEBO (default SIMULATOR = unchanged behaviour).
+from lidar_gazebo_backend import GazeboScanFileBackend, LidarStaleError
+
+from lidar_obstacle_detector import (
+    LidarObstacleDetector,
+    ObstacleDetectorConfig,
+)
+
+from lidar_obstacle_tracker_v3 import (
+    LidarObstacleTrackerV3,
+    TrackerV3Config,
+)
+
+
+# ============================================================
+# NIDAR V18
+# STABLE HEADLESS CAMERA + LiDAR SENSOR FUSION
+#
+# Camera:
+#   Mac webcam -> NIDAR V11 -> JSON packet
+#
+# LiDAR:
+#   STL-19P simulator
+#
+# Fusion:
+#   Camera bearing + LiDAR bearing
+#
+# Tracking:
+#   Persistent stable ID
+#   ACTIVE
+#   TEMP_LOST
+#   PREDICTED
+#   EXPIRED
+#
+# V18 improvements:
+#   - Range outlier rejection
+#   - Bearing outlier rejection
+#   - Position smoothing
+#   - Velocity smoothing
+#   - Better identity recovery
+#   - Stable ID recovery after short dropouts
+#
+# Display:
+#   DISABLED
+#
+# Flight control:
+#   DISABLED
+# ============================================================
+
+
+# ============================================================
+# PATHS
+# ============================================================
+
+# V18.1 (2026-11-01): previously hard-coded to "~/drone_project".  That only
+# matched the receiver's output location when the project lived exactly
+# there (the Pi), so in WSL (/mnt/d/NIDAR_DRONE_PROJECT) V18 silently read a
+# file nobody wrote and reported CAMERA STALE forever.  Default to the project
+# root derived from this file's location (identical result on the Pi);
+# NIDAR_PROJECT_DIR overrides it.
+PROJECT_DIR = os.environ.get(
+    "NIDAR_PROJECT_DIR",
+    _PROJECT_ROOT
+)
+
+CAMERA_PACKET = os.path.join(
+    PROJECT_DIR,
+    "src",
+    "communication",
+    "nidar_latest_perception.json"
+)
+
+OUTPUT_JSON = os.path.join(
+    PROJECT_DIR,
+    "nidar_v18_headless_persistent_fusion.json"
+)
+
+OUTPUT_CSV = os.path.join(
+    PROJECT_DIR,
+    "nidar_v18_headless_persistent_fusion.csv"
+)
+
+
+# ============================================================
+# BASIC CONFIGURATION
+# ============================================================
+
+FUSION_GATE_DEG = 10.0
+
+# Fallback only: since 2026-11-02 the width carried in every camera packet
+# ("camera": {"width": ...}) is used, so a 640-px Gazebo camera and the
+# 1280-px webcam both give correct bearings.
+CAMERA_WIDTH = 1280.0
+CAMERA_HFOV_DEG = float(os.environ.get("NIDAR_CAMERA_HFOV_DEG", "70.0"))
+
+# LiDAR source (2026-11-02): SIMULATOR (default) or GAZEBO
+LIDAR_BACKEND = os.environ.get("NIDAR_LIDAR_BACKEND", "SIMULATOR").strip().upper()
+
+# Labels written to the V18 JSON; set from the real sources in main().
+LIDAR_SOURCE_LABEL = "STL-19P_SIMULATOR"
+CAMERA_SOURCE_LABEL = "mac_webcam"
+
+LOOP_DELAY = 0.05
+
+PRINT_EVERY_N_FRAMES = 10
+
+
+# ============================================================
+# PERSISTENCE
+# ============================================================
+
+TEMP_LOST_TIMEOUT_SEC = 1.5
+
+EXPIRE_TIMEOUT_SEC = 3.0
+
+# V18.1 (2026-11-01): the main loop runs at 20 Hz (LOOP_DELAY) while the
+# camera delivers ~11 Hz, so a loop tick without a new camera frame is the
+# NORMAL case, not a loss.  Persistent objects are aged (ACTIVE -> TEMP_LOST
+# -> PREDICTED -> EXPIRED) only after the camera has been silent for longer
+# than this grace period (about 2-3 camera periods).
+CAMERA_GRACE_SEC = 0.25
+
+
+# ============================================================
+# SMOOTHING
+# ============================================================
+
+POSITION_ALPHA = 0.35
+
+VELOCITY_ALPHA = 0.30
+
+RANGE_ALPHA = 0.35
+
+BEARING_ALPHA = 0.35
+
+
+# ============================================================
+# V18 OUTLIER FILTER
+# ============================================================
+
+# Minimum physically usable range.
+MIN_VALID_RANGE_M = 0.15
+
+# Maximum simulated/expected working range.
+MAX_VALID_RANGE_M = 30.0
+
+# Maximum sudden range change.
+#
+# Example:
+#   previous = 4.01 m
+#   bad      = 0.04 m
+#
+# This will be rejected.
+MAX_RANGE_JUMP_ABS_M = 1.00
+
+MAX_RANGE_JUMP_RATIO = 0.35
+
+
+# Maximum bearing change accepted in one measurement.
+MAX_BEARING_JUMP_DEG = 25.0
+
+
+# Maximum spatial displacement allowed for
+# identity recovery.
+MAX_IDENTITY_DISTANCE_M = 2.50
+
+# Maximum range difference for identity recovery.
+MAX_IDENTITY_RANGE_DIFF_M = 2.00
+
+# Maximum bearing difference for identity recovery.
+MAX_IDENTITY_BEARING_DIFF_DEG = 30.0
+
+
+# How long an object can still be recovered
+# using spatial/class information.
+IDENTITY_RECOVERY_TIMEOUT_SEC = 3.0
+
+
+# ============================================================
+# FLIGHT CONTROL
+# ============================================================
+
+FLIGHT_CONTROL = False
+
+
+# ============================================================
+# GLOBAL SHUTDOWN
+# ============================================================
+
+running = True
+
+
+def handle_shutdown(signum, frame):
+    global running
+
+    print()
+    print("Shutdown requested...")
+
+    running = False
+
+
+signal.signal(
+    signal.SIGINT,
+    handle_shutdown
+)
+
+signal.signal(
+    signal.SIGTERM,
+    handle_shutdown
+)
+
+
+# ============================================================
+# CAMERA PACKET
+# ============================================================
+
+def load_camera_packet():
+
+    try:
+
+        with open(
+            CAMERA_PACKET,
+            "r"
+        ) as f:
+
+            return json.load(f)
+
+    except (
+        FileNotFoundError,
+        json.JSONDecodeError,
+    ):
+
+        return None
+
+    except Exception:
+
+        return None
+
+
+# ============================================================
+# ANGULAR DIFFERENCE
+# ============================================================
+
+def angular_difference(
+    a,
+    b
+):
+
+    try:
+
+        a = float(a)
+        b = float(b)
+
+    except Exception:
+
+        return 999.0
+
+    diff = abs(
+        a - b
+    )
+
+    while diff > 180.0:
+
+        diff -= 360.0
+
+    return abs(
+        diff
+    )
+
+
+# ============================================================
+# ANGULAR SMOOTHING
+# ============================================================
+
+def smooth_angle(
+    old_angle,
+    new_angle,
+    alpha
+):
+
+    if old_angle is None:
+
+        return new_angle
+
+    old_rad = math.radians(
+        old_angle
+    )
+
+    new_rad = math.radians(
+        new_angle
+    )
+
+    old_x = math.cos(
+        old_rad
+    )
+
+    old_y = math.sin(
+        old_rad
+    )
+
+    new_x = math.cos(
+        new_rad
+    )
+
+    new_y = math.sin(
+        new_rad
+    )
+
+    x = (
+        (1.0 - alpha) * old_x
+        +
+        alpha * new_x
+    )
+
+    y = (
+        (1.0 - alpha) * old_y
+        +
+        alpha * new_y
+    )
+
+    return math.degrees(
+        math.atan2(
+            y,
+            x
+        )
+    )
+
+
+# ============================================================
+# CAMERA BEARING
+# ============================================================
+
+def packet_camera_width(packet):
+    """Width (px) of the image the packet's pixel coordinates refer to."""
+    try:
+        width = float(packet["camera"]["width"])
+    except (KeyError, TypeError, ValueError):
+        return CAMERA_WIDTH
+    if not math.isfinite(width) or width < 16:
+        return CAMERA_WIDTH
+    return width
+
+
+def camera_bearing_from_object(
+    obj,
+    camera_width=None
+):
+
+    center = obj.get(
+        "center"
+    )
+
+    if not center:
+
+        return None
+
+    try:
+
+        center_x = float(
+            center[0]
+        )
+
+    except (
+        ValueError,
+        TypeError,
+        IndexError,
+    ):
+
+        return None
+
+    width = (
+        CAMERA_WIDTH
+        if camera_width is None
+        else float(camera_width)
+    )
+
+    normalized = (
+        center_x
+        -
+        width / 2.0
+    ) / (
+        width / 2.0
+    )
+
+    bearing = (
+        normalized
+        *
+        CAMERA_HFOV_DEG
+        /
+        2.0
+    )
+
+    return bearing
+
+
+# ============================================================
+# NORMALIZE LiDAR TRACK
+# ============================================================
+
+def normalize_track(
+    track
+):
+
+    if isinstance(
+        track,
+        dict
+    ):
+
+        result = track.copy()
+
+    else:
+
+        result = {}
+
+        fields = [
+
+            "track_id",
+            "id",
+
+            "distance_m",
+            "range_m",
+            "distance",
+
+            "bearing_deg",
+            "bearing",
+            "angle_deg",
+            "angle",
+
+            "speed_mps",
+            "speed",
+            "velocity_mps",
+            "velocity",
+
+            "x_m",
+            "y_m",
+
+            "state",
+            "confidence",
+        ]
+
+        for field in fields:
+
+            if hasattr(
+                track,
+                field
+            ):
+
+                try:
+
+                    result[field] = getattr(
+                        track,
+                        field
+                    )
+
+                except Exception:
+
+                    pass
+
+    # --------------------------------------------------------
+    # Track ID
+    # --------------------------------------------------------
+
+    if (
+        "track_id" not in result
+        and
+        "id" in result
+    ):
+
+        result["track_id"] = (
+            result["id"]
+        )
+
+    # --------------------------------------------------------
+    # Distance
+    # --------------------------------------------------------
+
+    if "distance_m" not in result:
+
+        for field in [
+            "range_m",
+            "distance",
+        ]:
+
+            if field in result:
+
+                result["distance_m"] = (
+                    result[field]
+                )
+
+                break
+
+    # --------------------------------------------------------
+    # Bearing
+    # --------------------------------------------------------
+
+    if "bearing_deg" not in result:
+
+        for field in [
+            "bearing",
+            "angle_deg",
+            "angle",
+        ]:
+
+            if field in result:
+
+                result["bearing_deg"] = (
+                    result[field]
+                )
+
+                break
+
+    # --------------------------------------------------------
+    # Speed
+    # --------------------------------------------------------
+
+    if "speed_mps" not in result:
+
+        for field in [
+            "speed",
+            "velocity_mps",
+            "velocity",
+        ]:
+
+            if field in result:
+
+                result["speed_mps"] = (
+                    result[field]
+                )
+
+                break
+
+    return result
+
+
+# ============================================================
+# CAMERA + LiDAR FUSION
+# ============================================================
+
+def fuse_objects(
+    camera_objects,
+    lidar_tracks,
+    camera_width=None
+):
+
+    fused = []
+
+    used_lidar = set()
+
+    camera_measurements = []
+
+    # --------------------------------------------------------
+    # Calculate camera bearings
+    # --------------------------------------------------------
+
+    for obj in camera_objects:
+
+        bearing = (
+            camera_bearing_from_object(
+                obj,
+                camera_width
+            )
+        )
+
+        if bearing is None:
+
+            continue
+
+        camera_measurements.append(
+            (
+                obj,
+                bearing
+            )
+        )
+
+    # --------------------------------------------------------
+    # Match camera objects with LiDAR
+    # --------------------------------------------------------
+
+    for (
+        camera_object,
+        camera_bearing
+    ) in camera_measurements:
+
+        best_track = None
+
+        best_error = float(
+            "inf"
+        )
+
+        for lidar_track in lidar_tracks:
+
+            lidar_id = (
+                lidar_track.get(
+                    "track_id"
+                )
+            )
+
+            if lidar_id is None:
+
+                continue
+
+            if lidar_id in used_lidar:
+
+                continue
+
+            try:
+
+                lidar_bearing = float(
+                    lidar_track.get(
+                        "bearing_deg",
+                        0.0
+                    )
+                )
+
+            except (
+                ValueError,
+                TypeError,
+            ):
+
+                continue
+
+            error = angular_difference(
+                camera_bearing,
+                lidar_bearing
+            )
+
+            if (
+                error <= FUSION_GATE_DEG
+                and
+                error < best_error
+            ):
+
+                best_track = (
+                    lidar_track
+                )
+
+                best_error = (
+                    error
+                )
+
+        if best_track is None:
+
+            continue
+
+        lidar_id = (
+            best_track.get(
+                "track_id"
+            )
+        )
+
+        used_lidar.add(
+            lidar_id
+        )
+
+        # ----------------------------------------------------
+        # Range
+        # ----------------------------------------------------
+
+        try:
+
+            distance = float(
+                best_track.get(
+                    "distance_m",
+                    0.0
+                )
+            )
+
+        except Exception:
+
+            distance = 0.0
+
+        # ----------------------------------------------------
+        # Bearing
+        # ----------------------------------------------------
+
+        try:
+
+            lidar_bearing = float(
+                best_track.get(
+                    "bearing_deg",
+                    0.0
+                )
+            )
+
+        except Exception:
+
+            lidar_bearing = 0.0
+
+        # ----------------------------------------------------
+        # Speed
+        # ----------------------------------------------------
+
+        try:
+
+            lidar_speed = float(
+                best_track.get(
+                    "speed_mps",
+                    0.0
+                )
+            )
+
+        except Exception:
+
+            lidar_speed = 0.0
+
+        # ----------------------------------------------------
+        # Camera confidence
+        # ----------------------------------------------------
+
+        try:
+
+            camera_confidence = float(
+                camera_object.get(
+                    "confidence",
+                    0.0
+                )
+            )
+
+        except Exception:
+
+            camera_confidence = 0.0
+
+        # ----------------------------------------------------
+        # Fusion quality
+        # ----------------------------------------------------
+
+        fusion_quality = max(
+            0.0,
+            1.0 -
+            (
+                best_error
+                /
+                FUSION_GATE_DEG
+            )
+        )
+
+        fusion_confidence = (
+            0.60 *
+            camera_confidence
+            +
+            0.40 *
+            fusion_quality
+        )
+
+        # ----------------------------------------------------
+        # Fused object
+        # ----------------------------------------------------
+
+        fused.append({
+
+            "camera_id":
+                camera_object.get(
+                    "id"
+                ),
+
+            "lidar_id":
+                lidar_id,
+
+            "class":
+                camera_object.get(
+                    "class",
+                    "unknown"
+                ),
+
+            "camera_bearing_deg":
+                round(
+                    camera_bearing,
+                    3
+                ),
+
+            "lidar_bearing_deg":
+                round(
+                    lidar_bearing,
+                    3
+                ),
+
+            "bearing_error_deg":
+                round(
+                    best_error,
+                    3
+                ),
+
+            "range_m":
+                round(
+                    distance,
+                    3
+                ),
+
+            "speed_mps":
+                round(
+                    lidar_speed,
+                    3
+                ),
+
+            "confidence":
+                round(
+                    camera_confidence,
+                    3
+                ),
+
+            "fusion_confidence":
+                round(
+                    fusion_confidence,
+                    3
+                ),
+
+            "fusion_status":
+                "FUSED",
+        })
+
+    return fused
+
+
+# ============================================================
+# PERSISTENT TARGET MANAGER V18
+# ============================================================
+
+class PersistentTargetManager:
+
+    def __init__(self):
+
+        self.next_id = 1
+
+        self.objects = {}
+
+
+    # ========================================================
+    # CREATE ID
+    # ========================================================
+
+    def create_id(
+        self
+    ):
+
+        value = (
+            self.next_id
+        )
+
+        self.next_id += 1
+
+        return value
+
+
+    # ========================================================
+    # POSITION FROM RANGE + BEARING
+    # ========================================================
+
+    @staticmethod
+    def polar_to_xy(
+        range_m,
+        bearing_deg
+    ):
+
+        angle_rad = math.radians(
+            bearing_deg
+        )
+
+        x = (
+            range_m
+            *
+            math.sin(
+                angle_rad
+            )
+        )
+
+        y = (
+            range_m
+            *
+            math.cos(
+                angle_rad
+            )
+        )
+
+        return x, y
+
+
+    # ========================================================
+    # IDENTITY DISTANCE
+    # ========================================================
+
+    @staticmethod
+    def spatial_distance(
+        obj,
+        x,
+        y
+    ):
+
+        old_x = obj.get(
+            "x_m"
+        )
+
+        old_y = obj.get(
+            "y_m"
+        )
+
+        if (
+            old_x is None
+            or
+            old_y is None
+        ):
+
+            return float(
+                "inf"
+            )
+
+        return math.sqrt(
+            (
+                x - old_x
+            ) ** 2
+            +
+            (
+                y - old_y
+            ) ** 2
+        )
+
+
+    # ========================================================
+    # FIND EXISTING OBJECT
+    # ========================================================
+
+    def find_match(
+        self,
+        camera_id,
+        lidar_id,
+        class_name,
+        measured_range,
+        measured_bearing
+    ):
+
+        now = time.time()
+
+        candidates = []
+
+        x, y = (
+            self.polar_to_xy(
+                measured_range,
+                measured_bearing
+            )
+        )
+
+        for (
+            object_id,
+            obj
+        ) in self.objects.items():
+
+            if (
+                obj.get("state")
+                ==
+                "EXPIRED"
+            ):
+
+                continue
+
+            last_seen = obj.get(
+                "last_seen_time",
+                0.0
+            )
+
+            age = (
+                now -
+                last_seen
+            )
+
+            if (
+                age >
+                IDENTITY_RECOVERY_TIMEOUT_SEC
+            ):
+
+                continue
+
+            previous_class = (
+                obj.get(
+                    "class"
+                )
+            )
+
+            if (
+                previous_class
+                !=
+                class_name
+            ):
+
+                continue
+
+            previous_camera = (
+                obj.get(
+                    "camera_id"
+                )
+            )
+
+            previous_lidar = (
+                obj.get(
+                    "lidar_id"
+                )
+            )
+
+            # ------------------------------------------------
+            # Exact camera + LiDAR match
+            # ------------------------------------------------
+
+            if (
+                camera_id is not None
+                and
+                lidar_id is not None
+                and
+                previous_camera
+                ==
+                camera_id
+                and
+                previous_lidar
+                ==
+                lidar_id
+            ):
+
+                candidates.append(
+                    (
+                        object_id,
+                        0,
+                        0.0
+                    )
+                )
+
+                continue
+
+            # ------------------------------------------------
+            # Exact camera match
+            # ------------------------------------------------
+
+            if (
+                camera_id is not None
+                and
+                previous_camera
+                ==
+                camera_id
+            ):
+
+                candidates.append(
+                    (
+                        object_id,
+                        1,
+                        0.0
+                    )
+                )
+
+                continue
+
+            # ------------------------------------------------
+            # Exact LiDAR match
+            # ------------------------------------------------
+
+            if (
+                lidar_id is not None
+                and
+                previous_lidar
+                ==
+                lidar_id
+            ):
+
+                candidates.append(
+                    (
+                        object_id,
+                        2,
+                        0.0
+                    )
+                )
+
+                continue
+
+            # ------------------------------------------------
+            # Spatial recovery
+            # ------------------------------------------------
+
+            spatial = (
+                self.spatial_distance(
+                    obj,
+                    x,
+                    y
+                )
+            )
+
+            if (
+                spatial
+                <=
+                MAX_IDENTITY_DISTANCE_M
+            ):
+
+                old_range = obj.get(
+                    "range_m"
+                )
+
+                old_bearing = obj.get(
+                    "bearing_deg"
+                )
+
+                range_error = 0.0
+
+                bearing_error = 0.0
+
+                if old_range is not None:
+
+                    range_error = abs(
+                        measured_range
+                        -
+                        float(old_range)
+                    )
+
+                if old_bearing is not None:
+
+                    bearing_error = (
+                        angular_difference(
+                            measured_bearing,
+                            float(old_bearing)
+                        )
+                    )
+
+                if (
+                    range_error
+                    <=
+                    MAX_IDENTITY_RANGE_DIFF_M
+                    and
+                    bearing_error
+                    <=
+                    MAX_IDENTITY_BEARING_DIFF_DEG
+                ):
+
+                    score = (
+                        spatial
+                        +
+                        range_error
+                        +
+                        (
+                            bearing_error
+                            *
+                            0.03
+                        )
+                        +
+                        (
+                            age
+                            *
+                            0.25
+                        )
+                    )
+
+                    candidates.append(
+                        (
+                            object_id,
+                            3,
+                            score
+                        )
+                    )
+
+        if not candidates:
+
+            return None
+
+        candidates.sort(
+            key=lambda item: (
+                item[1],
+                item[2]
+            )
+        )
+
+        return candidates[0][0]
+
+
+    # ========================================================
+    # RANGE OUTLIER CHECK
+    # ========================================================
+
+    @staticmethod
+    def range_is_valid(
+        old_range,
+        new_range
+    ):
+
+        if (
+            new_range
+            <
+            MIN_VALID_RANGE_M
+        ):
+
+            return False
+
+        if (
+            new_range
+            >
+            MAX_VALID_RANGE_M
+        ):
+
+            return False
+
+        if old_range is None:
+
+            return True
+
+        difference = abs(
+            new_range
+            -
+            old_range
+        )
+
+        allowed = max(
+            MAX_RANGE_JUMP_ABS_M,
+            old_range
+            *
+            MAX_RANGE_JUMP_RATIO
+        )
+
+        return (
+            difference
+            <=
+            allowed
+        )
+
+
+    # ========================================================
+    # BEARING OUTLIER CHECK
+    # ========================================================
+
+    @staticmethod
+    def bearing_is_valid(
+        old_bearing,
+        new_bearing
+    ):
+
+        if old_bearing is None:
+
+            return True
+
+        difference = (
+            angular_difference(
+                old_bearing,
+                new_bearing
+            )
+        )
+
+        return (
+            difference
+            <=
+            MAX_BEARING_JUMP_DEG
+        )
+
+
+    # ========================================================
+    # CREATE NEW OBJECT
+    # ========================================================
+
+    def create_object(
+        self,
+        now
+    ):
+
+        object_id = (
+            self.create_id()
+        )
+
+        self.objects[
+            object_id
+        ] = {
+
+            "stable_id":
+                object_id,
+
+            "created_time":
+                now,
+
+            "first_seen_time":
+                now,
+
+            "last_seen_time":
+                now,
+
+            "state":
+                "ACTIVE",
+
+            "hits":
+                0,
+
+            "lost_count":
+                0,
+
+            "prediction_count":
+                0,
+
+            "outlier_count":
+                0,
+
+            "range_m":
+                None,
+
+            "bearing_deg":
+                None,
+
+            "x_m":
+                None,
+
+            "y_m":
+                None,
+
+            "z_m":
+                None,
+
+            "speed_mps":
+                0.0,
+
+            "last_valid_range_m":
+                None,
+
+            "last_valid_bearing_deg":
+                None,
+        }
+
+        return object_id
+
+
+    # ========================================================
+    # UPDATE
+    # ========================================================
+
+    def update(
+        self,
+        fused_objects
+    ):
+
+        now = time.time()
+
+        output = []
+
+        active_ids = set()
+
+        # ====================================================
+        # UPDATE FUSED OBJECTS
+        # ====================================================
+
+        for fused in fused_objects:
+
+            camera_id = (
+                fused.get(
+                    "camera_id"
+                )
+            )
+
+            lidar_id = (
+                fused.get(
+                    "lidar_id"
+                )
+            )
+
+            class_name = (
+                fused.get(
+                    "class",
+                    "unknown"
+                )
+            )
+
+            # ------------------------------------------------
+            # Read measurements
+            # ------------------------------------------------
+
+            try:
+
+                measured_range = float(
+                    fused.get(
+                        "range_m",
+                        0.0
+                    )
+                )
+
+            except Exception:
+
+                measured_range = 0.0
+
+            try:
+
+                measured_bearing = float(
+                    fused.get(
+                        "camera_bearing_deg",
+                        0.0
+                    )
+                )
+
+            except Exception:
+
+                measured_bearing = 0.0
+
+            # ------------------------------------------------
+            # First reject impossible range
+            # ------------------------------------------------
+
+            if (
+                measured_range
+                <
+                MIN_VALID_RANGE_M
+                or
+                measured_range
+                >
+                MAX_VALID_RANGE_M
+            ):
+
+                # Don't allow impossible measurements
+                # to create a new object.
+                continue
+
+            # ------------------------------------------------
+            # Find persistent identity
+            # ------------------------------------------------
+
+            object_id = (
+                self.find_match(
+                    camera_id,
+                    lidar_id,
+                    class_name,
+                    measured_range,
+                    measured_bearing
+                )
+            )
+
+            # ------------------------------------------------
+            # Create object if no match
+            # ------------------------------------------------
+
+            if object_id is None:
+
+                object_id = (
+                    self.create_object(
+                        now
+                    )
+                )
+
+            obj = self.objects[
+                object_id
+            ]
+
+            # ------------------------------------------------
+            # Previous measurements
+            # ------------------------------------------------
+
+            old_range = obj.get(
+                "last_valid_range_m"
+            )
+
+            old_bearing = obj.get(
+                "last_valid_bearing_deg"
+            )
+
+            old_x = obj.get(
+                "x_m"
+            )
+
+            old_y = obj.get(
+                "y_m"
+            )
+
+            old_time = obj.get(
+                "last_seen_time"
+            )
+
+            # ------------------------------------------------
+            # Validate range
+            # ------------------------------------------------
+
+            range_valid = (
+                self.range_is_valid(
+                    old_range,
+                    measured_range
+                )
+            )
+
+            if not range_valid:
+
+                obj[
+                    "outlier_count"
+                ] = (
+                    obj.get(
+                        "outlier_count",
+                        0
+                    )
+                    +
+                    1
+                )
+
+                # Keep previous good range.
+                if old_range is not None:
+
+                    measured_range = (
+                        float(old_range)
+                    )
+
+                else:
+
+                    continue
+
+            # ------------------------------------------------
+            # Validate bearing
+            # ------------------------------------------------
+
+            bearing_valid = (
+                self.bearing_is_valid(
+                    old_bearing,
+                    measured_bearing
+                )
+            )
+
+            if not bearing_valid:
+
+                obj[
+                    "outlier_count"
+                ] = (
+                    obj.get(
+                        "outlier_count",
+                        0
+                    )
+                    +
+                    1
+                )
+
+                if old_bearing is not None:
+
+                    measured_bearing = (
+                        float(old_bearing)
+                    )
+
+            # ------------------------------------------------
+            # Polar -> Cartesian
+            # ------------------------------------------------
+
+            measured_x, measured_y = (
+                self.polar_to_xy(
+                    measured_range,
+                    measured_bearing
+                )
+            )
+
+            # ------------------------------------------------
+            # Position smoothing
+            # ------------------------------------------------
+
+            if (
+                old_x is not None
+                and
+                old_y is not None
+            ):
+
+                x_m = (
+                    (
+                        1.0
+                        -
+                        POSITION_ALPHA
+                    )
+                    *
+                    old_x
+                    +
+                    POSITION_ALPHA
+                    *
+                    measured_x
+                )
+
+                y_m = (
+                    (
+                        1.0
+                        -
+                        POSITION_ALPHA
+                    )
+                    *
+                    old_y
+                    +
+                    POSITION_ALPHA
+                    *
+                    measured_y
+                )
+
+            else:
+
+                x_m = measured_x
+
+                y_m = measured_y
+
+            # ------------------------------------------------
+            # Calculate speed from position
+            # ------------------------------------------------
+
+            calculated_speed = 0.0
+
+            if (
+                old_x is not None
+                and
+                old_y is not None
+                and
+                old_time is not None
+            ):
+
+                dt = (
+                    now
+                    -
+                    old_time
+                )
+
+                if dt > 0.001:
+
+                    dx = (
+                        x_m
+                        -
+                        old_x
+                    )
+
+                    dy = (
+                        y_m
+                        -
+                        old_y
+                    )
+
+                    calculated_speed = (
+                        math.sqrt(
+                            dx * dx
+                            +
+                            dy * dy
+                        )
+                        /
+                        dt
+                    )
+
+            # ------------------------------------------------
+            # LiDAR speed
+            # ------------------------------------------------
+
+            try:
+
+                lidar_speed = float(
+                    fused.get(
+                        "speed_mps",
+                        0.0
+                    )
+                )
+
+            except Exception:
+
+                lidar_speed = 0.0
+
+            # ------------------------------------------------
+            # Protect against impossible speed
+            # ------------------------------------------------
+
+            if (
+                calculated_speed
+                >
+                20.0
+            ):
+
+                calculated_speed = (
+                    0.0
+                )
+
+            if (
+                lidar_speed
+                <
+                0.0
+                or
+                lidar_speed
+                >
+                20.0
+            ):
+
+                lidar_speed = 0.0
+
+            # ------------------------------------------------
+            # Combine speed
+            # ------------------------------------------------
+
+            raw_speed = (
+                0.60
+                *
+                lidar_speed
+                +
+                0.40
+                *
+                calculated_speed
+            )
+
+            previous_speed = float(
+                obj.get(
+                    "speed_mps",
+                    0.0
+                )
+            )
+
+            speed_mps = (
+                (
+                    1.0
+                    -
+                    VELOCITY_ALPHA
+                )
+                *
+                previous_speed
+                +
+                VELOCITY_ALPHA
+                *
+                raw_speed
+            )
+
+            # ------------------------------------------------
+            # Stable range smoothing
+            # ------------------------------------------------
+
+            previous_smoothed_range = (
+                obj.get(
+                    "range_m"
+                )
+            )
+
+            if (
+                previous_smoothed_range
+                is not None
+            ):
+
+                smoothed_range = (
+                    (
+                        1.0
+                        -
+                        RANGE_ALPHA
+                    )
+                    *
+                    float(
+                        previous_smoothed_range
+                    )
+                    +
+                    RANGE_ALPHA
+                    *
+                    measured_range
+                )
+
+            else:
+
+                smoothed_range = (
+                    measured_range
+                )
+
+            # ------------------------------------------------
+            # Stable bearing smoothing
+            # ------------------------------------------------
+
+            previous_smoothed_bearing = (
+                obj.get(
+                    "bearing_deg"
+                )
+            )
+
+            smoothed_bearing = (
+                smooth_angle(
+                    previous_smoothed_bearing,
+                    measured_bearing,
+                    BEARING_ALPHA
+                )
+            )
+
+            # ------------------------------------------------
+            # Update persistent state
+            # ------------------------------------------------
+
+            obj[
+                "camera_id"
+            ] = camera_id
+
+            obj[
+                "lidar_id"
+            ] = lidar_id
+
+            obj[
+                "class"
+            ] = class_name
+
+            obj[
+                "range_m"
+            ] = round(
+                smoothed_range,
+                3
+            )
+
+            obj[
+                "bearing_deg"
+            ] = round(
+                smoothed_bearing,
+                3
+            )
+
+            obj[
+                "x_m"
+            ] = round(
+                x_m,
+                3
+            )
+
+            obj[
+                "y_m"
+            ] = round(
+                y_m,
+                3
+            )
+
+            obj[
+                "z_m"
+            ] = None
+
+            obj[
+                "speed_mps"
+            ] = round(
+                speed_mps,
+                3
+            )
+
+            obj[
+                "bearing_error_deg"
+            ] = fused.get(
+                "bearing_error_deg",
+                0.0
+            )
+
+            obj[
+                "camera_confidence"
+            ] = fused.get(
+                "confidence",
+                0.0
+            )
+
+            obj[
+                "fusion_confidence"
+            ] = fused.get(
+                "fusion_confidence",
+                0.0
+            )
+
+            obj[
+                "last_seen_time"
+            ] = now
+
+            obj[
+                "last_valid_range_m"
+            ] = (
+                measured_range
+            )
+
+            obj[
+                "last_valid_bearing_deg"
+            ] = (
+                measured_bearing
+            )
+
+            obj[
+                "state"
+            ] = "ACTIVE"
+
+            obj[
+                "hits"
+            ] = (
+                obj.get(
+                    "hits",
+                    0
+                )
+                +
+                1
+            )
+
+            obj[
+                "lost_count"
+            ] = 0
+
+            active_ids.add(
+                object_id
+            )
+
+            output.append(
+                obj.copy()
+            )
+
+        # ====================================================
+        # HANDLE LOST OBJECTS
+        # ====================================================
+
+        for (
+            object_id,
+            obj
+        ) in self.objects.items():
+
+            if (
+                object_id
+                in
+                active_ids
+            ):
+
+                continue
+
+            if (
+                obj.get(
+                    "state"
+                )
+                ==
+                "EXPIRED"
+            ):
+
+                continue
+
+            last_seen = (
+                obj.get(
+                    "last_seen_time",
+                    0.0
+                )
+            )
+
+            age = (
+                now
+                -
+                last_seen
+            )
+
+            # ------------------------------------------------
+            # TEMPORARILY LOST
+            # ------------------------------------------------
+
+            if (
+                age
+                <=
+                TEMP_LOST_TIMEOUT_SEC
+            ):
+
+                obj[
+                    "state"
+                ] = "TEMP_LOST"
+
+                obj[
+                    "lost_count"
+                ] = (
+                    obj.get(
+                        "lost_count",
+                        0
+                    )
+                    +
+                    1
+                )
+
+                output.append(
+                    obj.copy()
+                )
+
+            # ------------------------------------------------
+            # PREDICTED
+            # ------------------------------------------------
+
+            elif (
+                age
+                <=
+                EXPIRE_TIMEOUT_SEC
+            ):
+
+                obj[
+                    "state"
+                ] = "PREDICTED"
+
+                obj[
+                    "prediction_count"
+                ] = (
+                    obj.get(
+                        "prediction_count",
+                        0
+                    )
+                    +
+                    1
+                )
+
+                # Keep last valid position.
+                # We intentionally don't invent
+                # a movement vector.
+
+                output.append(
+                    obj.copy()
+                )
+
+            # ------------------------------------------------
+            # EXPIRED
+            # ------------------------------------------------
+
+            else:
+
+                obj[
+                    "state"
+                ] = "EXPIRED"
+
+        return output
+
+
+# ============================================================
+# SAVE JSON
+# ============================================================
+
+def save_json(
+    frame,
+    camera_objects,
+    lidar_tracks,
+    fused_objects,
+    persistent_objects
+):
+
+    data = {
+
+        "protocol":
+            "NIDAR_V18_HEADLESS_PERSISTENT_FUSION",
+
+        "timestamp":
+            time.time(),
+
+        "frame":
+            frame,
+
+        "camera_source":
+            CAMERA_SOURCE_LABEL,
+
+        "lidar_source":
+            LIDAR_SOURCE_LABEL,
+
+        "flight_control":
+            "DISABLED",
+
+        "display":
+            "DISABLED",
+
+        "headless":
+            True,
+
+        "configuration": {
+
+            "fusion_gate_deg":
+                FUSION_GATE_DEG,
+
+            "temp_lost_timeout_sec":
+                TEMP_LOST_TIMEOUT_SEC,
+
+            "expire_timeout_sec":
+                EXPIRE_TIMEOUT_SEC,
+
+            "min_valid_range_m":
+                MIN_VALID_RANGE_M,
+
+            "max_valid_range_m":
+                MAX_VALID_RANGE_M,
+
+            "max_range_jump_abs_m":
+                MAX_RANGE_JUMP_ABS_M,
+
+            "max_range_jump_ratio":
+                MAX_RANGE_JUMP_RATIO,
+
+            "max_bearing_jump_deg":
+                MAX_BEARING_JUMP_DEG,
+
+            "identity_recovery_timeout_sec":
+                IDENTITY_RECOVERY_TIMEOUT_SEC,
+        },
+
+        "camera_objects":
+            camera_objects,
+
+        "lidar_tracks":
+            lidar_tracks,
+
+        "fused_objects":
+            fused_objects,
+
+        "persistent_objects":
+            persistent_objects,
+    }
+
+    temp_file = (
+        OUTPUT_JSON
+        +
+        ".tmp"
+    )
+
+    with open(
+        temp_file,
+        "w"
+    ) as f:
+
+        json.dump(
+            data,
+            f,
+            indent=2
+        )
+
+    os.replace(
+        temp_file,
+        OUTPUT_JSON
+    )
+
+
+# ============================================================
+# SAVE CSV
+# ============================================================
+
+def save_csv(
+    frame,
+    objects
+):
+
+    file_exists = os.path.exists(
+        OUTPUT_CSV
+    )
+
+    with open(
+        OUTPUT_CSV,
+        "a",
+        newline=""
+    ) as f:
+
+        writer = csv.writer(
+            f
+        )
+
+        if not file_exists:
+
+            writer.writerow([
+
+                "timestamp",
+                "frame",
+
+                "stable_id",
+
+                "camera_id",
+                "lidar_id",
+
+                "class",
+                "state",
+
+                "range_m",
+                "bearing_deg",
+
+                "x_m",
+                "y_m",
+                "z_m",
+
+                "speed_mps",
+
+                "bearing_error_deg",
+
+                "camera_confidence",
+                "fusion_confidence",
+
+                "hits",
+                "lost_count",
+                "prediction_count",
+
+                "outlier_count",
+            ])
+
+        timestamp = time.time()
+
+        for obj in objects:
+
+            writer.writerow([
+
+                timestamp,
+
+                frame,
+
+                obj.get(
+                    "stable_id"
+                ),
+
+                obj.get(
+                    "camera_id"
+                ),
+
+                obj.get(
+                    "lidar_id"
+                ),
+
+                obj.get(
+                    "class"
+                ),
+
+                obj.get(
+                    "state"
+                ),
+
+                obj.get(
+                    "range_m"
+                ),
+
+                obj.get(
+                    "bearing_deg"
+                ),
+
+                obj.get(
+                    "x_m"
+                ),
+
+                obj.get(
+                    "y_m"
+                ),
+
+                obj.get(
+                    "z_m"
+                ),
+
+                obj.get(
+                    "speed_mps"
+                ),
+
+                obj.get(
+                    "bearing_error_deg"
+                ),
+
+                obj.get(
+                    "camera_confidence"
+                ),
+
+                obj.get(
+                    "fusion_confidence"
+                ),
+
+                obj.get(
+                    "hits"
+                ),
+
+                obj.get(
+                    "lost_count"
+                ),
+
+                obj.get(
+                    "prediction_count"
+                ),
+
+                obj.get(
+                    "outlier_count"
+                ),
+            ])
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    global LIDAR_SOURCE_LABEL, CAMERA_SOURCE_LABEL
+
+    print("=" * 100)
+
+    print(
+        "NIDAR V18 - STABLE HEADLESS CAMERA + LiDAR FUSION"
+    )
+
+    print("=" * 100)
+
+    print(
+        f"Camera packet : {CAMERA_PACKET}"
+    )
+
+    print(
+        "Camera source : MAC WEBCAM / NIDAR V11"
+    )
+
+    print(
+        f"LiDAR source  : {LIDAR_BACKEND}"
+    )
+
+    print(
+        f"Fusion gate   : ±{FUSION_GATE_DEG:.1f}°"
+    )
+
+    print(
+        f"Temp lost     : "
+        f"{TEMP_LOST_TIMEOUT_SEC:.1f}s"
+    )
+
+    print(
+        f"Expire        : "
+        f"{EXPIRE_TIMEOUT_SEC:.1f}s"
+    )
+
+    print(
+        f"Range filter  : "
+        f"{MIN_VALID_RANGE_M:.2f}m - "
+        f"{MAX_VALID_RANGE_M:.1f}m"
+    )
+
+    print(
+        f"Range jump    : "
+        f"{MAX_RANGE_JUMP_ABS_M:.2f}m / "
+        f"{MAX_RANGE_JUMP_RATIO * 100:.0f}%"
+    )
+
+    print(
+        f"Bearing jump  : "
+        f"{MAX_BEARING_JUMP_DEG:.1f}°"
+    )
+
+    print(
+        "Identity recovery : ENABLED"
+    )
+
+    print(
+        "Flight control: DISABLED"
+    )
+
+    print(
+        "Display       : DISABLED"
+    )
+
+    print("=" * 100)
+
+    # ========================================================
+    # INITIALIZE LiDAR
+    # ========================================================
+
+    try:
+
+        if LIDAR_BACKEND == "GAZEBO":
+            backend = GazeboScanFileBackend()
+        elif LIDAR_BACKEND == "SIMULATOR":
+            backend = (
+                SimulatedSTL19PBackend()
+            )
+        else:
+            raise RuntimeError(
+                f"NIDAR_LIDAR_BACKEND={LIDAR_BACKEND!r} "
+                "(V18 supports SIMULATOR or GAZEBO)"
+            )
+
+        LIDAR_SOURCE_LABEL = backend.name
+
+        detector = (
+            LidarObstacleDetector(
+                ObstacleDetectorConfig()
+            )
+        )
+
+        tracker = (
+            LidarObstacleTrackerV3(
+                TrackerV3Config()
+            )
+        )
+
+    except Exception as e:
+
+        print()
+
+        print(
+            "LiDAR initialization FAILED"
+        )
+
+        print(
+            f"ERROR: {e}"
+        )
+
+        return 1
+
+    print(
+        f"LiDAR backend      : {LIDAR_SOURCE_LABEL} READY"
+    )
+
+    print(
+        "LiDAR detector     : READY"
+    )
+
+    print(
+        "LiDAR tracker V3   : READY"
+    )
+
+    print(
+        "Persistent manager : READY"
+    )
+
+    print(
+        "Outlier filter     : READY"
+    )
+
+    print(
+        "Identity recovery  : READY"
+    )
+
+    print(
+        "Headless mode      : ENABLED"
+    )
+
+    print("=" * 100)
+
+    # ========================================================
+    # MANAGER
+    # ========================================================
+
+    manager = (
+        PersistentTargetManager()
+    )
+
+    last_camera_frame = None
+    latest_camera_objects = []
+    latest_camera_width = CAMERA_WIDTH
+    latest_camera_packet_time = None
+    camera_waiting_reported = False
+    last_status_print = 0.0
+
+    # V18.1: the last persistent-object report is repeated on loop ticks
+    # that fall between two normal camera frames (see CAMERA_GRACE_SEC).
+    persistent_objects = []
+
+    processed_frames = 0
+    lidar_cycles = 0
+
+    total_fused = 0
+    total_active = 0
+    total_temp_lost = 0
+    total_predicted = 0
+    total_outliers = 0
+
+    start_time = time.time()
+
+    # ========================================================
+    # MAIN LOOP
+    #
+    # IMPORTANT V18 FIX:
+    # LiDAR/simulator processing is independent of camera-frame
+    # arrival. The old loop skipped everything when the camera JSON
+    # frame did not change, which made V18 look frozen whenever the
+    # Mac camera/stream process was stopped or disconnected.
+    #
+    # New behavior:
+    #   1. Always advance LiDAR simulator/tracker.
+    #   2. Process camera + fusion only when a NEW camera frame arrives.
+    #   3. If the camera is stale, age persistent objects with an empty
+    #      fusion update so TEMP_LOST/PREDICTED/EXPIRED still works.
+    #   4. Print a heartbeat while waiting for the Mac stream.
+    # ========================================================
+
+    while running:
+
+        loop_start = time.time()
+
+        # ----------------------------------------------------
+        # CAMERA INPUT
+        # ----------------------------------------------------
+
+        packet = load_camera_packet()
+        camera_new = False
+        frame = last_camera_frame
+
+        if packet is not None:
+
+            candidate_frame = packet.get("frame")
+            candidate_objects = packet.get("objects", [])
+
+            if candidate_frame is not None:
+
+                try:
+                    candidate_frame = int(candidate_frame)
+                except (TypeError, ValueError):
+                    candidate_frame = None
+
+                if candidate_frame is not None and candidate_frame != last_camera_frame:
+                    frame = candidate_frame
+                    last_camera_frame = candidate_frame
+                    latest_camera_objects = candidate_objects
+                    latest_camera_width = packet_camera_width(packet)
+                    try:
+                        CAMERA_SOURCE_LABEL = str(packet["camera"]["source"])
+                    except (KeyError, TypeError):
+                        pass
+                    latest_camera_packet_time = time.time()
+                    camera_new = True
+                    processed_frames += 1
+                    camera_waiting_reported = False
+
+        # ----------------------------------------------------
+        # LiDAR / SIMULATOR -- ALWAYS RUNS
+        # ----------------------------------------------------
+
+        try:
+
+            scan = backend.next_scan()
+            lidar_detections = detector.detect(scan)
+
+            timestamp = time.time()
+            lidar_tracks_raw = tracker.update(
+                lidar_detections,
+                timestamp
+            )
+
+            lidar_cycles += 1
+
+        except LidarStaleError as e:
+
+            # Gazebo LiDAR silent: no fusion, V18 JSON not refreshed, so the
+            # AirMouse server reports V18_STALE and the bridge sends zero.
+            print("[LiDAR STALE]", e, "-- fusion paused", flush=True)
+            continue
+
+        except Exception as e:
+
+            print("[LiDAR ERROR]", e)
+            time.sleep(LOOP_DELAY)
+            continue
+
+        # ----------------------------------------------------
+        # NORMALIZE LiDAR TRACKS
+        # ----------------------------------------------------
+
+        lidar_tracks = []
+
+        for track in lidar_tracks_raw:
+            normalized = normalize_track(track)
+            if normalized:
+                lidar_tracks.append(normalized)
+
+        # ----------------------------------------------------
+        # CAMERA + LiDAR FUSION
+        # ----------------------------------------------------
+
+        if camera_new:
+
+            camera_objects = list(latest_camera_objects)
+
+            fused_objects = fuse_objects(
+                camera_objects,
+                lidar_tracks,
+                latest_camera_width
+            )
+
+            total_fused += len(fused_objects)
+
+            persistent_objects = manager.update(
+                fused_objects
+            )
+
+        else:
+
+            # No new camera observation. Do NOT reuse the same camera
+            # frame as a fresh detection.
+            camera_objects = list(latest_camera_objects)
+            fused_objects = []
+
+            # V18.1 (2026-11-01): previously manager.update([]) ran on
+            # EVERY tick without a new frame, which flipped every object
+            # ACTIVE -> TEMP_LOST -> ACTIVE between consecutive camera
+            # frames (20 Hz loop vs ~11 Hz camera) and made the downstream
+            # target server / ROS 2 bridge publish zero commands ~40% of
+            # the time with the target in plain view (measured with
+            # src/simulation/nidar_pipeline_sim.py, scenario "nominal").
+            # Age persistent tracks only once the camera has really been
+            # silent for CAMERA_GRACE_SEC; otherwise repeat the last report.
+            camera_silent = (
+                latest_camera_packet_time is None
+                or (time.time() - latest_camera_packet_time) >= CAMERA_GRACE_SEC
+            )
+
+            if camera_silent:
+                persistent_objects = manager.update([])
+
+        # ----------------------------------------------------
+        # STATISTICS
+        # ----------------------------------------------------
+
+        for obj in persistent_objects:
+
+            state = obj.get("state")
+
+            if state == "ACTIVE":
+                total_active += 1
+
+            elif state == "TEMP_LOST":
+                total_temp_lost += 1
+
+            elif state == "PREDICTED":
+                total_predicted += 1
+
+            try:
+                total_outliers += int(obj.get("outlier_count", 0))
+            except (TypeError, ValueError):
+                pass
+
+        # ----------------------------------------------------
+        # SAVE STATE
+        # ----------------------------------------------------
+
+        if frame is not None:
+
+            try:
+                save_json(
+                    frame,
+                    camera_objects,
+                    lidar_tracks,
+                    fused_objects,
+                    persistent_objects
+                )
+            except Exception as e:
+                print("[JSON SAVE ERROR]", e)
+
+            try:
+                save_csv(
+                    frame,
+                    persistent_objects
+                )
+            except Exception as e:
+                print("[CSV SAVE ERROR]", e)
+
+        # ----------------------------------------------------
+        # TERMINAL OUTPUT / HEARTBEAT
+        # ----------------------------------------------------
+
+        now = time.time()
+        should_report = (
+            camera_new and
+            processed_frames > 0 and
+            processed_frames % PRINT_EVERY_N_FRAMES == 0
+        )
+
+        # While camera is disconnected/stale, report once per second
+        # so the program visibly keeps running instead of appearing frozen.
+        camera_age = None
+        if latest_camera_packet_time is not None:
+            camera_age = now - latest_camera_packet_time
+
+        if (
+            not camera_new and
+            now - last_status_print >= 1.0
+        ):
+            last_status_print = now
+
+            elapsed = max(now - start_time, 0.001)
+            fps = lidar_cycles / elapsed
+
+            if latest_camera_packet_time is None:
+                print(
+                    f"[V18] WAITING FOR MAC CAMERA | "
+                    f"LiDAR cycles={lidar_cycles} | "
+                    f"tracks={len(lidar_tracks)} | "
+                    f"LiDAR FPS={fps:.2f}"
+                )
+            else:
+                print(
+                    f"[V18] CAMERA STALE | age={camera_age:.2f}s | "
+                    f"last_frame={last_camera_frame} | "
+                    f"LiDAR cycles={lidar_cycles} | "
+                    f"tracks={len(lidar_tracks)} | "
+                    f"persistent={len(persistent_objects)}"
+                )
+
+        if should_report:
+
+            last_status_print = now
+            elapsed = max(now - start_time, 0.001)
+            fps = processed_frames / elapsed
+
+            print("-" * 100)
+            print(f"Frame              : {frame}")
+            print(f"Camera NEW         : YES")
+            print(f"Camera objects     : {len(camera_objects)}")
+            print(f"LiDAR detections   : {len(lidar_detections)}")
+            print(f"LiDAR tracks       : {len(lidar_tracks)}")
+            print(f"Fused objects      : {len(fused_objects)}")
+            print(f"Persistent objects : {len(persistent_objects)}")
+            print(f"Processing FPS     : {fps:.2f}")
+
+            if persistent_objects:
+                for obj in persistent_objects:
+                    print(
+                        "OBJECT             : "
+                        f"S{obj.get('stable_id')} | "
+                        f"{obj.get('class')} | "
+                        f"state={obj.get('state')} | "
+                        f"range={obj.get('range_m', 0.0):.2f}m | "
+                        f"bearing={obj.get('bearing_deg', 0.0):+.2f}° | "
+                        f"X={obj.get('x_m', 0.0):+.2f}m | "
+                        f"Y={obj.get('y_m', 0.0):+.2f}m | "
+                        f"speed={obj.get('speed_mps', 0.0):.2f}m/s | "
+                        f"conf={obj.get('fusion_confidence', 0.0):.2f} | "
+                        f"outliers={obj.get('outlier_count', 0)}"
+                    )
+            else:
+                print("OBJECT             : none")
+
+        # ----------------------------------------------------
+        # LOOP TIMING
+        # ----------------------------------------------------
+
+        processing_time = time.time() - loop_start
+        remaining = LOOP_DELAY - processing_time
+
+        if remaining > 0:
+            time.sleep(remaining)
+
+    # ========================================================
+    # SHUTDOWN
+    # ========================================================
+
+    elapsed = max(
+        time.time()
+        -
+        start_time,
+        0.001
+    )
+
+    fps = (
+        processed_frames
+        /
+        elapsed
+    )
+
+    print()
+
+    print("=" * 100)
+
+    print(
+        "NIDAR V18 SHUTDOWN"
+    )
+
+    print("=" * 100)
+
+    print(
+        f"Frames processed : "
+        f"{processed_frames}"
+    )
+
+    print(
+        f"Total fused      : "
+        f"{total_fused}"
+    )
+
+    print(
+        f"Active reports   : "
+        f"{total_active}"
+    )
+
+    print(
+        f"Temp lost reports: "
+        f"{total_temp_lost}"
+    )
+
+    print(
+        f"Predicted reports: "
+        f"{total_predicted}"
+    )
+
+    print(
+        f"Average FPS      : "
+        f"{fps:.2f}"
+    )
+
+    print(
+        f"JSON output      : "
+        f"{OUTPUT_JSON}"
+    )
+
+    print(
+        f"CSV output       : "
+        f"{OUTPUT_CSV}"
+    )
+
+    print(
+        "Flight control   : DISABLED"
+    )
+
+    print(
+        "Display          : DISABLED"
+    )
+
+    print("=" * 100)
+
+    return 0
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
+
+if __name__ == "__main__":
+
+    sys.exit(
+        main()
+    )

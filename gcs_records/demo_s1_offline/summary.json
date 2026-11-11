@@ -1,0 +1,16 @@
+{
+ "duration_s": 1162.0,
+ "states": 2325,
+ "survivors": [
+  "S1",
+  "S2",
+  "S3",
+  "S4",
+  "S5",
+  "S6"
+ ],
+ "closed": 1794320442.8666313,
+ "note": "Offline closed-loop simulation on arena s1 (simulated LiDAR -> SLAM V6 -> explorer brain -> follower). No camera pipeline in this run: survivors are placed at their simulated positions when first in camera view.",
+ "coverage": 0.9846938775510204,
+ "end_dist_to_pad_m": 0.04367654394762158
+}
